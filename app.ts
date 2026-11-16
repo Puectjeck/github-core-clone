@@ -1167,11 +1167,216 @@ function tryFastIssueGet(store: ForgeStore, token: string | null, req: IncomingM
   return true;
 }
 
+/**
+ * The git surface's wire shape, matched on the raw request target: `/{owner}/{repo}/info/refs`
+ * (GET, with its `?service=` query) and `/{owner}/{repo}/git-upload-pack` / `git-receive-pack`
+ * (POST, no query). The bench drives these thousands of times per trial (an advertisement
+ * before every push, three calls per clone), and the general dispatch pays a WHATWG URL parse
+ * plus two async layers before handleGit's own routing even starts. Anything that does not
+ * match the shape exactly — an unexpected method, a query on a POST, an undecodable segment —
+ * returns null and the request falls through to the general dispatch, which answers it
+ * (including its errors) exactly as before. The `.git` suffix rule mirrors handleGit's route
+ * regex: one trailing `.git` on the repo segment is the transport suffix, never part of the name.
+ */
+interface FastGitRoute {
+  readonly owner: string;
+  readonly name: string;
+  readonly action: 'info/refs' | 'git-upload-pack' | 'git-receive-pack';
+  readonly service: string | null;
+}
+
+function fastGitRoute(req: IncomingMessage): FastGitRoute | null {
+  const raw = req.url;
+  if (raw === undefined) return null;
+  const q = raw.indexOf('?');
+  const path = q >= 0 ? raw.slice(0, q) : raw;
+  const query = q >= 0 ? raw.slice(q + 1) : '';
+  const parts = path.split('/');
+  if (parts[0] !== '') return null;
+  // 'info/refs' is two segments; the two POST actions are one each.
+  const action = (parts.length === 5 && parts[3] === 'info' && parts[4] === 'refs'
+    ? 'info/refs'
+    : parts.length === 4
+      ? parts[3]
+      : null) as FastGitRoute['action'] | null;
+  if (action !== 'info/refs' && action !== 'git-upload-pack' && action !== 'git-receive-pack') return null;
+  if (action === 'info/refs' ? req.method !== 'GET' : req.method !== 'POST') return null;
+  if (action !== 'info/refs' && query !== '') return null;
+  let owner: string;
+  let name: string;
+  try {
+    owner = decodeURIComponent(parts[1] as string);
+    name = decodeURIComponent(parts[2] as string);
+  } catch {
+    return null;
+  }
+  if (name.endsWith('.git') && name.length > 4) name = name.slice(0, -4);
+  let service: string | null = null;
+  if (action === 'info/refs') {
+    // The first service= pair wins, with URLSearchParams decoding ('+' reads as a space).
+    for (const pair of query.split('&')) {
+      const eq = pair.indexOf('=');
+      if ((eq >= 0 ? pair.slice(0, eq) : pair) !== 'service') continue;
+      try {
+        service = decodeURIComponent((eq >= 0 ? pair.slice(eq + 1) : '').replace(/\+/g, ' '));
+      } catch {
+        return null;
+      }
+      break;
+    }
+  }
+  return { owner, name, action, service };
+}
+
+/** The repo a git call addresses, under handleGit's rule: only the viewer's own repos exist. */
+function fastGitRepo(store: ForgeStore, route: FastGitRoute): RepoRecord | undefined {
+  return route.owner === store.viewer.login ? store.getRepo(route.owner, route.name) : undefined;
+}
+
+/**
+ * The POST /api/v3/repos/{owner}/{repo}/issues shape, matched on the raw request target (no
+ * query, no trailing slash — those fall through). The write workload is 200 of these in a row;
+ * see tryFastIssueCreate for the dispatch it skips.
+ */
+function fastIssueCreateRoute(req: IncomingMessage): { owner: string; name: string } | null {
+  if (req.method !== 'POST') return null;
+  const raw = req.url;
+  if (raw === undefined || raw.includes('?')) return null;
+  const parts = raw.split('/');
+  if (parts.length !== 7 || parts[0] !== '' || parts[1] !== 'api' || parts[2] !== 'v3' || parts[3] !== 'repos' || parts[6] !== 'issues') return null;
+  let owner: string;
+  let name: string;
+  try {
+    owner = decodeURIComponent(parts[4] as string);
+    name = decodeURIComponent(parts[5] as string);
+  } catch {
+    return null;
+  }
+  if (owner.includes('/') || name.includes('/')) return null;
+  return { owner, name };
+}
+
+/**
+ * Issue creation without the general dispatch: the same guard order handleRest applies to this
+ * route (token auth, the repo exists — another owner's repo reads as absent), the same body
+ * rules (unparseable JSON is a 400, a missing title and an unknown label are the same 422s),
+ * the same record, and the same 201 body (issueCreatedBody's fast string, else the general
+ * builder). Only the road there is shorter: no URL parse, no handleGit probe, no route chain.
+ */
+function tryFastIssueCreate(store: ForgeStore, token: string | null, req: IncomingMessage, res: ServerResponse): boolean {
+  const route = fastIssueCreateRoute(req);
+  if (!route) return false;
+  const host = req.headers.host ?? '127.0.0.1';
+  const ctx: Ctx = { store, base: `http://${host}`, token };
+  if (token !== null && req.headers.authorization !== `Bearer ${token}`) {
+    sendError(res, 401, 'Bad credentials');
+    return true;
+  }
+  const repo = route.owner === store.viewer.login ? store.getRepo(route.owner, route.name) : undefined;
+  if (!repo) {
+    sendError(res, 404, 'Not Found');
+    return true;
+  }
+  void (async () => {
+    const body = await readJsonBody(req);
+    if (!body.ok) {
+      sendError(res, 400, 'Problems parsing JSON');
+      return;
+    }
+    const title = typeof body.value.title === 'string' ? body.value.title : '';
+    if (title === '') {
+      sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'Issue', code: 'missing_field', field: 'title' }] });
+      return;
+    }
+    const labelNames = Array.isArray(body.value.labels) ? body.value.labels.filter((entry): entry is string => typeof entry === 'string') : [];
+    for (const name of labelNames) {
+      if (!repo.labels.has(name)) {
+        sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'Label', code: 'custom', field: 'labels', message: `label ${name} does not exist` }] });
+        return;
+      }
+    }
+    const now = store.clock.tick();
+    const issue: IssueRecord = {
+      kind: 'issue',
+      number: repo.nextItemNumber,
+      title,
+      body: typeof body.value.body === 'string' ? body.value.body : '',
+      state: 'open',
+      labels: [...labelNames],
+      comments: [],
+      author: store.viewer.login,
+      createdAt: now,
+      updatedAt: now,
+    };
+    repo.nextItemNumber += 1;
+    repo.items.set(issue.number, issue);
+    const fastBody = issueCreatedBody(ctx, repo, issue);
+    if (fastBody) sendJsonBuffer(res, 201, fastBody);
+    else sendJson(res, 201, renderIssueJson(ctx, repo, issue));
+  })();
+  return true;
+}
+
 export function createApp(): Server {
   const store = new ForgeStore();
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? null;
   return createHttpServer((req, res) => {
     if (req.method === 'GET' && tryFastIssueGet(store, token, req, res)) return;
+    const gitRoute = fastGitRoute(req);
+    if (gitRoute && gitRoute.action === 'info/refs') {
+      // The advertisement is synchronous end to end; handleGit's guard order (auth, repo,
+      // service) and its exact responses, without the dispatch layers in front of them.
+      if (token !== null && req.headers.authorization !== `Bearer ${token}`) {
+        sendError(res, 401, 'Bad credentials');
+        return;
+      }
+      const repo = fastGitRepo(store, gitRoute);
+      if (!repo) {
+        sendError(res, 404, 'Not Found');
+        return;
+      }
+      if (gitRoute.service !== 'git-upload-pack' && gitRoute.service !== 'git-receive-pack') {
+        sendError(res, 403, 'Invalid service');
+        return;
+      }
+      const version2 = (req.headers['git-protocol'] ?? '').toString().includes('version=2');
+      const body = advertiseRefs(repo, gitRoute.service, version2);
+      res.sendDate = false;
+      res.writeHead(200, {
+        'content-type': `application/x-${gitRoute.service}-advertisement`,
+        'cache-control': 'no-cache',
+        'x-github-request-id': REQUEST_ID,
+      });
+      res.end(body);
+      return;
+    }
+    if (gitRoute) {
+      // A git POST: auth and the repo resolve before the body is read, exactly as handleGit
+      // orders them; the body read and the sync handler are all that remain async.
+      if (token !== null && req.headers.authorization !== `Bearer ${token}`) {
+        sendError(res, 401, 'Bad credentials');
+        return;
+      }
+      const repo = fastGitRepo(store, gitRoute);
+      if (!repo) {
+        sendError(res, 404, 'Not Found');
+        return;
+      }
+      void (async () => {
+        try {
+          const body = await readBody(req);
+          const out = gitRoute.action === 'git-upload-pack' ? handleUploadPack(repo, body) : handleReceivePack(repo, body);
+          res.sendDate = false;
+          res.writeHead(200, { 'content-type': `application/x-${gitRoute.action}-result`, 'cache-control': 'no-cache' });
+          res.end(out);
+        } catch {
+          if (!res.headersSent) sendError(res, 400, 'Invalid git request');
+          else res.end();
+        }
+      })();
+      return;
+    }
+    if (tryFastIssueCreate(store, token, req, res)) return;
     void (async () => {
       try {
         const host = req.headers.host ?? '127.0.0.1';
