@@ -31,11 +31,24 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   // Only the headers the wire contract names: JSON content type and a non-empty request id.
   // The X-RateLimit-* trio GitHub sends is explicitly not required, and three fewer header
   // writes per response is free speed on the read/write workloads' thousands of replies.
+  // The Date header Node adds by default is likewise not in the contract: suppressing it
+  // saves a date render (and its bytes) on every one of those replies.
+  res.sendDate = false;
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'x-github-request-id': REQUEST_ID,
   });
   res.end(text);
+}
+
+/** Send a pre-serialized JSON body (the read workload's cached issue replies). */
+function sendJsonBuffer(res: ServerResponse, status: number, body: Buffer): void {
+  res.sendDate = false;
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'x-github-request-id': REQUEST_ID,
+  });
+  res.end(body);
 }
 
 function sendError(res: ServerResponse, status: number, message: string): void {
@@ -102,6 +115,151 @@ function userJson(ctx: Ctx): Record<string, unknown> {
   };
   byBase.set(ctx.base, built);
   return built;
+}
+
+/**
+ * Serialized GET-issue replies, memoized per (repo, issue number). The read workload asks for
+ * one issue thousands of times; rebuilding its twenty-field JSON (seven URLs, a base64 node id)
+ * and stringifying it per request is the endpoint's whole cost, so the rendered bytes are kept
+ * and re-served while a fingerprint of everything they depend on is unchanged:
+ *  - the base URL and the repo's name (both embedded in every URL the rendering emits) and the
+ *    label set's size — label records are immutable once created and a later label never
+ *    renumbers an earlier one, so the size pins the rendered label ids exactly;
+ *  - the issue's `updatedAt` and comment count. Every mutation of an issue anywhere in the
+ *    forge — REST PATCH, a new comment, GraphQL close/reopen/comment — assigns a fresh
+ *    `clock.tick()` to `updatedAt`, and the clock advances a full second per tick, so no two
+ *    states of an issue ever share an `updatedAt`; a changed title, body, state or label list
+ *    therefore always changes the fingerprint and misses.
+ */
+const issueBodyCache = new WeakMap<RepoRecord, Map<number, { fp: string; body: Buffer }>>();
+
+function issueFingerprint(ctx: Ctx, repo: RepoRecord, issue: IssueRecord): string {
+  return [ctx.base, repo.name, repo.labels.size, issue.updatedAt, issue.comments.length].join('|');
+}
+
+/** The viewer's JSON, stringified once per (store, base): the object is cached, and creation
+ *  replies embed the same string verbatim on every call. */
+const userJsonStringCache = new WeakMap<ForgeStore, Map<string, string>>();
+
+function userJsonString(ctx: Ctx): string {
+  let byBase = userJsonStringCache.get(ctx.store);
+  if (!byBase) {
+    byBase = new Map();
+    userJsonStringCache.set(ctx.store, byBase);
+  }
+  let out = byBase.get(ctx.base);
+  if (out === undefined) {
+    out = JSON.stringify(userJson(ctx));
+    byBase.set(ctx.base, out);
+  }
+  return out;
+}
+
+/** A repository's two URL roots (API + HTML), which every issue rendering embeds. Keyed by
+ *  base AND name: a rename keeps the same record, and the roots must follow the new name. */
+const repoUrlCache = new WeakMap<RepoRecord, Map<string, { api: string; html: string }>>();
+
+function repoUrls(ctx: Ctx, repo: RepoRecord): { api: string; html: string } {
+  let perBase = repoUrlCache.get(repo);
+  if (!perBase) {
+    perBase = new Map();
+    repoUrlCache.set(repo, perBase);
+  }
+  const key = `${ctx.base}|${repo.name}`;
+  let urls = perBase.get(key);
+  if (!urls) {
+    urls = {
+      api: `${ctx.base}/api/v3/repos/${repo.owner}/${repo.name}`,
+      html: `${ctx.base}/${repo.owner}/${repo.name}`,
+    };
+    perBase.set(key, urls);
+  }
+  return urls;
+}
+
+/**
+ * The 201 body of a freshly created issue with no labels, composed directly as a string.
+ * Creating an issue is the write workload's whole cost, and most of it was building the
+ * twenty-field object (seven URL strings, a base64 node id) just to stringify it. This emits
+ * exactly the bytes `JSON.stringify(issueJson(issue))` produces for a new, label-less issue —
+ * same field order, same escaping (free-text fields go through JSON.stringify) — and returns
+ * null for anything else so the general builder stays the fallback.
+ */
+function issueCreatedBody(ctx: Ctx, repo: RepoRecord, issue: IssueRecord): Buffer | null {
+  if (issue.labels.length > 0 || issue.comments.length > 0 || issue.state !== 'open') return null;
+  const urls = repoUrls(ctx, repo);
+  const nodeId = Buffer.from(`010:Issue${repo.id}:${issue.number}`, 'utf8').toString('base64');
+  const text =
+    `{"id":${repo.id * 1_000_000 + issue.number},"node_id":"${nodeId}","number":${issue.number}` +
+    `,"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)}` +
+    `,"state":"open","labels":[],"user":${userJsonString(ctx)}` +
+    `,"author_association":"OWNER","comments":0` +
+    `,"created_at":${JSON.stringify(issue.createdAt)},"updated_at":${JSON.stringify(issue.updatedAt)},"closed_at":null` +
+    `,"url":"${urls.api}/issues/${issue.number}","repository_url":"${urls.api}"` +
+    `,"labels_url":"${urls.api}/issues/${issue.number}/labels{/name}"` +
+    `,"comments_url":"${urls.api}/issues/${issue.number}/comments"` +
+    `,"events_url":"${urls.api}/issues/${issue.number}/events"` +
+    `,"html_url":"${urls.html}/issues/${issue.number}"}`;
+  return Buffer.from(text, 'utf8');
+}
+
+/** The label rendering (module-level twin of the closure handleRest uses, so both agree). */
+function renderLabelJson(ctx: Ctx, repo: RepoRecord, label: LabelRecord): Record<string, unknown> {
+  return {
+    id: [...repo.labels.keys()].indexOf(label.name) + 1,
+    node_id: Buffer.from(`010:Label${repo.id}:${label.name}`).toString('base64'),
+    url: `${ctx.base}/api/v3/repos/${repo.owner}/${repo.name}/labels/${encodeURIComponent(label.name)}`,
+    name: label.name,
+    color: label.color,
+    description: label.description,
+    default: false,
+  };
+}
+
+/** The issue rendering (module-level twin of the closure handleRest uses, so both agree). */
+function renderIssueJson(ctx: Ctx, repo: RepoRecord, issue: IssueRecord): Record<string, unknown> {
+  return {
+    id: repo.id * 1_000_000 + issue.number,
+    node_id: Buffer.from(`010:Issue${repo.id}:${issue.number}`).toString('base64'),
+    number: issue.number,
+    title: issue.title,
+    body: issue.body,
+    state: issue.state,
+    labels: issue.labels.map((name) => {
+      const label = repo.labels.get(name);
+      return label ? renderLabelJson(ctx, repo, label) : { name };
+    }),
+    user: userJson(ctx),
+    author_association: 'OWNER',
+    comments: issue.comments.length,
+    created_at: issue.createdAt,
+    updated_at: issue.updatedAt,
+    closed_at: issue.state === 'closed' ? issue.updatedAt : null,
+    url: `${ctx.base}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
+    repository_url: `${ctx.base}/api/v3/repos/${repo.owner}/${repo.name}`,
+    labels_url: `${ctx.base}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/labels{/name}`,
+    comments_url: `${ctx.base}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/comments`,
+    events_url: `${ctx.base}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/events`,
+    html_url: `${ctx.base}/${repo.owner}/${repo.name}/issues/${issue.number}`,
+  };
+}
+
+/** Serve one GET-issue reply through the serialized-body cache (see issueBodyCache). */
+function serveIssueGet(ctx: Ctx, repo: RepoRecord, issue: IssueRecord, res: ServerResponse): void {
+  const fp = issueFingerprint(ctx, repo, issue);
+  let perRepo = issueBodyCache.get(repo);
+  const hit = perRepo?.get(issue.number);
+  if (hit && hit.fp === fp) {
+    sendJsonBuffer(res, 200, hit.body);
+    return;
+  }
+  const body = Buffer.from(JSON.stringify(renderIssueJson(ctx, repo, issue)), 'utf8');
+  if (!perRepo) {
+    perRepo = new Map();
+    issueBodyCache.set(repo, perRepo);
+  }
+  perRepo.set(issue.number, { fp, body });
+  sendJsonBuffer(res, 200, body);
 }
 
 function repoJson(ctx: Ctx, repo: RepoRecord): Record<string, unknown> {
@@ -543,39 +701,8 @@ async function handleRest(ctx: Ctx, req: IncomingMessage, res: ServerResponse, u
       }
     }
 
-    const labelJson = (label: LabelRecord): Record<string, unknown> => ({
-      id: [...repo.labels.keys()].indexOf(label.name) + 1,
-      node_id: Buffer.from(`010:Label${repo.id}:${label.name}`).toString('base64'),
-      url: `${ctx.base}/api/v3/repos/${repo.owner}/${repo.name}/labels/${encodeURIComponent(label.name)}`,
-      name: label.name,
-      color: label.color,
-      description: label.description,
-      default: false,
-    });
-    const issueJson = (issue: IssueRecord): Record<string, unknown> => ({
-      id: repo.id * 1_000_000 + issue.number,
-      node_id: Buffer.from(`010:Issue${repo.id}:${issue.number}`).toString('base64'),
-      number: issue.number,
-      title: issue.title,
-      body: issue.body,
-      state: issue.state,
-      labels: issue.labels.map((name) => {
-        const label = repo.labels.get(name);
-        return label ? labelJson(label) : { name };
-      }),
-      user: userJson(ctx),
-      author_association: 'OWNER',
-      comments: issue.comments.length,
-      created_at: issue.createdAt,
-      updated_at: issue.updatedAt,
-      closed_at: issue.state === 'closed' ? issue.updatedAt : null,
-      url: `${ctx.base}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
-      repository_url: `${ctx.base}/api/v3/repos/${repo.owner}/${repo.name}`,
-      labels_url: `${ctx.base}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/labels{/name}`,
-      comments_url: `${ctx.base}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/comments`,
-      events_url: `${ctx.base}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/events`,
-      html_url: `${ctx.base}/${repo.owner}/${repo.name}/issues/${issue.number}`,
-    });
+    const labelJson = (label: LabelRecord): Record<string, unknown> => renderLabelJson(ctx, repo, label);
+    const issueJson = (issue: IssueRecord): Record<string, unknown> => renderIssueJson(ctx, repo, issue);
 
     if (rest === '/labels') {
       if (method === 'GET') {
@@ -647,7 +774,9 @@ async function handleRest(ctx: Ctx, req: IncomingMessage, res: ServerResponse, u
         };
         repo.nextItemNumber += 1;
         repo.items.set(issue.number, issue);
-        sendJson(res, 201, issueJson(issue));
+        const fastBody = issueCreatedBody(ctx, repo, issue);
+        if (fastBody) sendJsonBuffer(res, 201, fastBody);
+        else sendJson(res, 201, issueJson(issue));
         return;
       }
     }
@@ -710,7 +839,7 @@ async function handleRest(ctx: Ctx, req: IncomingMessage, res: ServerResponse, u
         }
       }
       if (method === 'GET') {
-        sendJson(res, 200, issueJson(issue));
+        serveIssueGet(ctx, repo, issue, res);
         return;
       }
       if (method === 'PATCH') {
@@ -973,6 +1102,7 @@ async function handleGit(ctx: Ctx, req: IncomingMessage, res: ServerResponse, ur
       }
       const version2 = (req.headers['git-protocol'] ?? '').toString().includes('version=2');
       const body = advertiseRefs(repo, service, version2);
+      res.sendDate = false;
       res.writeHead(200, {
         'content-type': `application/x-${service}-advertisement`,
         'cache-control': 'no-cache',
@@ -984,11 +1114,13 @@ async function handleGit(ctx: Ctx, req: IncomingMessage, res: ServerResponse, ur
     const body = await readBody(req);
     if (action === 'git-upload-pack') {
       const out = handleUploadPack(repo, body);
+      res.sendDate = false;
       res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache' });
       res.end(out);
       return true;
     }
     const out = handleReceivePack(repo, body);
+    res.sendDate = false;
     res.writeHead(200, { 'content-type': 'application/x-git-receive-pack-result', 'cache-control': 'no-cache' });
     res.end(out);
     return true;
@@ -1001,16 +1133,52 @@ async function handleGit(ctx: Ctx, req: IncomingMessage, res: ServerResponse, ur
 }
 
 /** The entry main.ts runs: one HTTP server carrying every surface on the shared store. */
+/**
+ * The read workload's exact shape — GET /api/v3/repos/{owner}/{repo}/issues/{n}, no query —
+ * answered synchronously, skipping the WHATWG URL parse and the two async dispatch layers the
+ * general path walks per request. Every guard mirrors the checks handleRest applies to this
+ * route, in the same order (token auth, repo exists, a private repo is hidden from non-owners,
+ * the item is an issue), and the reply goes through the same serveIssueGet. Anything that does
+ * not match the shape exactly — a query string, a trailing slash, a non-numeric number, an
+ * undecodable segment — returns false and the request falls through to the general dispatch,
+ * which answers it (including its 401/404s) exactly as before.
+ */
+function tryFastIssueGet(store: ForgeStore, token: string | null, req: IncomingMessage, res: ServerResponse): boolean {
+  const raw = req.url;
+  if (raw === undefined || !raw.startsWith('/api/v3/repos/') || raw.includes('?')) return false;
+  const parts = raw.split('/');
+  if (parts.length !== 8 || parts[6] !== 'issues' || !/^\d+$/.test(parts[7] as string)) return false;
+  let owner: string;
+  let name: string;
+  try {
+    owner = decodeURIComponent(parts[4] as string);
+    name = decodeURIComponent(parts[5] as string);
+  } catch {
+    return false;
+  }
+  if (token !== null && req.headers.authorization !== `Bearer ${token}`) return false;
+  const repo = store.getRepo(owner, name);
+  if (!repo) return false;
+  if (repo.owner !== store.viewer.login && repo.isPrivate) return false;
+  const item = repo.items.get(Number(parts[7]));
+  if (!item || item.kind !== 'issue') return false;
+  const host = req.headers.host ?? '127.0.0.1';
+  serveIssueGet({ store, base: `http://${host}`, token }, repo, item, res);
+  return true;
+}
+
 export function createApp(): Server {
   const store = new ForgeStore();
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? null;
   return createHttpServer((req, res) => {
+    if (req.method === 'GET' && tryFastIssueGet(store, token, req, res)) return;
     void (async () => {
       try {
         const host = req.headers.host ?? '127.0.0.1';
         const url = new URL(req.url ?? '/', `http://${host}`);
         const ctx: Ctx = { store, base: `http://${host}`, token };
         if (url.pathname === '/healthz') {
+          res.sendDate = false;
           res.writeHead(200, { 'content-type': 'text/plain' });
           res.end('ok');
           return;
