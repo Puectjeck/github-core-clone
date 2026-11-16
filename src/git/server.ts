@@ -33,17 +33,21 @@ function peeled(repo: RepoRecord, oid: string): string | null {
   return peelToCommit(repo.objects, oid);
 }
 
+/**
+ * The protocol-v2 advertisement names no refs and no per-repo state — the same bytes answer
+ * every v2 advertisement for every repository, so they are framed once and shared.
+ */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  FLUSH,
+]);
+
 export function advertiseRefs(repo: RepoRecord, service: 'git-upload-pack' | 'git-receive-pack', version2: boolean): Buffer {
-  if (service === 'git-upload-pack' && version2) {
-    const lines = [
-      'version 2',
-      `agent=${AGENT}`,
-      'ls-refs=unborn',
-      'fetch=shallow',
-      'object-format=sha1',
-    ];
-    return Buffer.concat([...lines.map((line) => pktLine(`${line}\n`)), FLUSH]);
-  }
+  if (service === 'git-upload-pack' && version2) return V2_ADVERTISEMENT;
   const caps = service === 'git-upload-pack' ? UPLOAD_CAPS_V0 : RECEIVE_CAPS;
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), FLUSH];
   const headTip = repo.refs.get(repo.headRef);
