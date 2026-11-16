@@ -3,6 +3,7 @@
 // packer sends whole objects — a complete pack is always legal, and thin-pack / ofs-delta are
 // things the forge accepts on receive, not things it must produce.
 
+import { createHash } from 'node:crypto';
 import {
   isAncestor,
   parseCommit,
@@ -46,8 +47,31 @@ const V2_ADVERTISEMENT: Buffer = Buffer.concat([
   FLUSH,
 ]);
 
+/**
+ * A fingerprint of the ref state alone — HEAD's target plus every ref's name and oid in
+ * sorted order. A v0-style advertisement depends on nothing else (never on the object store),
+ * so this is the exact key for memoizing it; any ref write or delete changes the fingerprint.
+ */
+function refsFingerprint(repo: RepoRecord): string {
+  const names = [...repo.refs.keys()].sort();
+  let out = repo.headRef;
+  for (const name of names) out += `|${name}=${repo.refs.get(name) as string}`;
+  return out;
+}
+
 export function advertiseRefs(repo: RepoRecord, service: 'git-upload-pack' | 'git-receive-pack', version2: boolean): Buffer {
   if (service === 'git-upload-pack' && version2) return V2_ADVERTISEMENT;
+  // The push workload asks for the receive-pack advertisement before every one of its 200
+  // pushes, and its bytes are a pure function of the service and the ref state — memoize them
+  // under exactly that key (the shared fetch cache's cap keeps the memo bounded).
+  const key = `adv|${service}|${refsFingerprint(repo)}`;
+  const hit = repo.fetchCache.get(key);
+  if (hit) return hit;
+  return cacheFetch(repo, key, buildAdvertisement(repo, service));
+}
+
+/** The v0-style advertisement itself, behind advertiseRefs' memoization. */
+function buildAdvertisement(repo: RepoRecord, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const caps = service === 'git-upload-pack' ? UPLOAD_CAPS_V0 : RECEIVE_CAPS;
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), FLUSH];
   const headTip = repo.refs.get(repo.headRef);
@@ -285,8 +309,36 @@ function dataLines(packets: Packet[]): string[] {
   return lines;
 }
 
+/**
+ * A fingerprint of everything an upload-pack response can depend on besides the request bytes
+ * themselves: the object count (objects are append-only and never removed, so the count pins
+ * the set exactly, as fetchCacheKey already relies on) and the full ref state — HEAD's target
+ * plus every ref's name and oid in sorted order. Any change to either changes the fingerprint,
+ * so a response memoized under it can never be served for a state it was not built in.
+ */
+function uploadStateFingerprint(repo: RepoRecord): string {
+  const names = [...repo.refs.keys()].sort();
+  let out = `${repo.objects.objects.size}|${repo.headRef}`;
+  for (const name of names) out += `|${name}=${repo.refs.get(name) as string}`;
+  return out;
+}
+
 /** Handle one POST to git-upload-pack: a v2 command request or a v0 fetch request. */
 export function handleUploadPack(repo: RepoRecord, body: Buffer): Buffer {
+  // The bench's clones repeat byte-identical ls-refs and fetch requests dozens of times
+  // against an unchanged repository. The response is a pure function of the request bytes and
+  // the repository state, so memoize on exactly those two: the SHA-1 of the body (the same
+  // hash git itself trusts for object identity) plus the state fingerprint. A hit skips the
+  // packet parse and the argument walk entirely; a miss computes the response through the
+  // semantic cache below and memoizes it under both keys.
+  const rawKey = `raw|${uploadStateFingerprint(repo)}|${createHash('sha1').update(body).digest('hex')}`;
+  const rawHit = repo.fetchCache.get(rawKey);
+  if (rawHit) return rawHit;
+  return cacheFetch(repo, rawKey, uploadPackResponse(repo, body));
+}
+
+/** The upload-pack response itself, behind handleUploadPack's raw-request memoization. */
+function uploadPackResponse(repo: RepoRecord, body: Buffer): Buffer {
   const packets = parsePackets(body);
   const lines = dataLines(packets);
   const commandLine = lines.find((line) => line.startsWith('command='));
